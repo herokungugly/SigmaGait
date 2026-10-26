@@ -1,0 +1,466 @@
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+from ..base_model import BaseModel
+from ..modules import HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, SetBlockWrapper, \
+    conv3x3, conv1x1, BasicBlock2D, BasicBlockP3D
+
+from einops import rearrange
+
+import copy
+
+
+class SigmaGait(BaseModel):
+
+    def build_network(self, model_cfg):
+        # B, C = [1, 4, 4, 1], 2
+        in_C, B, C = model_cfg['Backbone']['in_channels'], model_cfg['Backbone']['blocks'], model_cfg['Backbone']['C']
+        self.inference_use_emb = model_cfg['use_emb2'] if 'use_emb2' in model_cfg else False
+
+        self.inplanes = [64, 64]
+        self.sil_layer0 = SetBlockWrapper(nn.Sequential(
+            conv3x3(1, self.inplanes[0], 1),
+            nn.BatchNorm2d(self.inplanes[0]),
+            nn.ReLU(inplace=True)
+        ))
+
+        self.map_layer0 = SetBlockWrapper(nn.Sequential(
+            conv3x3(3, self.inplanes[1], 1),
+            nn.BatchNorm2d(self.inplanes[1]),
+        ))
+
+        self.sil_layer1 = SetBlockWrapper(self.make_layer(BasicBlock2D, 64, stride=[1, 1], blocks_num=B[0], mode='2d', inplane_idx=0))
+        self.map_layer1 = SetBlockWrapper(self.make_layer(BasicBlock2D, 64, stride=[1, 1], blocks_num=B[0], mode='2d', inplane_idx=1))
+        self.sil_layer2 = self.make_layer(BasicBlockP3D, 128, stride=[2, 2], blocks_num=B[1], mode='p3d', inplane_idx=0)
+        self.map_layer2 = self.make_layer(BasicBlockP3D, 128, stride=[2, 2], blocks_num=B[1], mode='p3d', inplane_idx=1)
+        self.sil_layer3 = self.make_layer(BasicBlockP3D, 256, stride=[2, 2], blocks_num=B[2], mode='p3d', inplane_idx=0)
+        self.map_layer3 = self.make_layer(BasicBlockP3D, 256, stride=[2, 2], blocks_num=B[2], mode='p3d', inplane_idx=1)
+        self.sil_layer4 = self.make_layer(BasicBlockP3D, 512, stride=[1, 1], blocks_num=B[3], mode='p3d', inplane_idx=0)
+        self.map_layer4 = self.make_layer(BasicBlockP3D, 512, stride=[1, 1], blocks_num=B[3], mode='p3d', inplane_idx=1)
+
+        self.num_heads = model_cfg['MultiHeadAttention']['num_heads']
+        self.head_dim = model_cfg['MultiHeadAttention']['head_dim']
+        self.vis = model_cfg['vis']
+        self.d_model = self.num_heads * self.head_dim
+        self.norm0 = nn.LayerNorm(256)
+        self.norm1 = nn.LayerNorm(256)
+        self.motion_attn = Shift_frame_attn(input_dim=256, output_dim=256, num_heads=self.num_heads, head_dim=self.head_dim)
+        self.fusion = AttentionFusion(512)
+        self.sil_CPE = ConditionalPosEmbedding(256)
+        self.map_CPE = ConditionalPosEmbedding(256)
+        # self.dropout = nn.Dropout(p=0.25)
+
+        self.TP = PackSequenceWrapper(torch.max)
+
+        self.FCs = SeparateFCs(self.num_heads, 256, 256)
+        self.BNNecks = SeparateBNNecks(self.num_heads+16, 256, class_num=model_cfg['SeparateBNNecks']['class_num'])
+
+        self.HPP = HorizontalPoolingPyramid(bin_num=[16])
+        self.FCs_sils = SeparateFCs(16, 512, 256)
+        self.FCs_map = SeparateFCs(16, 512, 256)
+        self.FCs_fusion = SeparateFCs(16, 512, 256)
+
+    def make_layer(self, block, planes, stride, blocks_num, mode='2d', inplane_idx=0):
+        if max(stride) > 1 or self.inplanes[inplane_idx] != planes * block.expansion:
+            if mode == '3d':
+                downsample = nn.Sequential(
+                    nn.Conv3d(self.inplanes[inplane_idx], planes * block.expansion, kernel_size=[1, 1, 1],
+                              stride=stride,
+                              padding=[0, 0, 0], bias=False), nn.BatchNorm3d(planes * block.expansion))
+            elif mode == '2d':
+                downsample = nn.Sequential(conv1x1(self.inplanes[inplane_idx], planes * block.expansion, stride=stride),
+                                           nn.BatchNorm2d(planes * block.expansion))
+            elif mode == 'p3d':
+                downsample = nn.Sequential(
+                    nn.Conv3d(self.inplanes[inplane_idx], planes * block.expansion, kernel_size=[1, 1, 1],
+                              stride=[1, *stride],
+                              padding=[0, 0, 0], bias=False), nn.BatchNorm3d(planes * block.expansion))
+            else:
+                raise TypeError('xxx')
+        else:
+            downsample = lambda x: x
+
+        layers = [block(self.inplanes[inplane_idx], planes, stride=stride, downsample=downsample)]
+        self.inplanes[inplane_idx] = planes * block.expansion
+        s = [1, 1] if mode in ['2d', 'p3d'] else [1, 1, 1]
+        for i in range(1, blocks_num):
+            layers.append(
+                block(self.inplanes[inplane_idx], planes, stride=s)
+            )
+        return nn.Sequential(*layers)
+
+    def inputs_pretreament(self, inputs):
+        ### Ensure the same data augmentation for heatmap and silhouette
+        pose_sils = inputs[0]
+        new_data_list = []
+        for pose, sil in zip(pose_sils[0], pose_sils[1]):
+            sil = sil[:, np.newaxis, ...]  # [T, 1, H, W]
+            pose_h, pose_w = pose.shape[-2], pose.shape[-1]
+            sil_h, sil_w = sil.shape[-2], sil.shape[-1]
+            if sil_h != sil_w and pose_h == pose_w:
+                cutting = (sil_h - sil_w) // 2
+                pose = pose[..., cutting:-cutting]
+            cat_data = np.concatenate([pose, sil], axis=1)  # [T, 3, H, W]
+            new_data_list.append(cat_data)
+        new_inputs = [[new_data_list], inputs[1], inputs[2], inputs[3], inputs[4]]
+        return super().inputs_pretreament(new_inputs)
+
+    def forward(self, inputs):
+        ipts, labs, _, _, seqL = inputs
+
+        pose = ipts[0]
+        pose = pose.transpose(1, 2).contiguous()
+        assert pose.size(-1) in [44, 48, 88, 96]
+        maps = pose[:, :3, ...]
+        sils = pose[:, -1, ...].unsqueeze(1)
+
+        del ipts
+        map0 = self.map_layer0(maps)
+        map1 = self.map_layer1(map0)
+        map2 = self.map_layer2(map1)
+        map3 = self.map_layer3(map2)
+        map4 = self.map_layer4(map3)
+
+        sil0 = self.sil_layer0(sils)
+        sil1 = self.sil_layer1(sil0)
+        sil2 = self.sil_layer2(sil1)
+        sil3 = self.sil_layer3(sil2)
+        sil4 = self.sil_layer4(sil3)
+
+        outs_fusion = self.fusion(map4, sil4)
+        outs_fusion = self.TP(outs_fusion, seqL, options={"dim": 2})[0]  # [n, c, h, w]
+        feat_fusion = self.HPP(outs_fusion)  # [n, c, p]
+        embed_fusion = self.FCs_fusion(feat_fusion)  # [n, c, p]
+
+        # Encoder loss
+        outs_sils = self.TP(sil4, seqL, options={"dim": 2})[0]  # [n, c, h, w]
+        feat_sils = self.HPP(outs_sils)  # [n, c, p]
+        embed_sils = self.FCs_sils(feat_sils)  # [n, c, p]
+
+        outs_map = self.TP(map4, seqL, options={"dim": 2})[0]  # [n, c, h, w]
+        feat_map = self.HPP(outs_map)  # [n, c, p]
+        embed_map = self.FCs_map(feat_map)  # [n, c, p]
+
+        # attention
+        n, c, s, h, w = map4.size()
+        map_feat = rearrange(map3, "n c s h w -> (n h w) s c")
+        sil_feat = rearrange(sil3, "n c s h w -> (n h w) s c")
+        map_feat = map_feat + self.map_CPE(map_feat)
+        sil_feat = sil_feat + self.sil_CPE(sil_feat)
+        map_feat = self.norm0(map_feat)
+        sil_feat = self.norm1(sil_feat)
+
+        out_motion, attn_map = self.motion_attn(sil_feat, map_feat, h, w)  # [np, s, c], [ns, p, h, w]
+        barlow_w = 1
+
+        # Temporal Pooling, TP
+        out_motion = self.TP(out_motion, seqL, dim=1, options={"dim": 1})[0]  # [np, c]
+        feat_motion = rearrange(out_motion, "(n p) c -> n c p", p=self.num_heads)  # [n, c, p]
+
+        embed_motion = self.FCs(feat_motion)
+        embed_1 = torch.cat([embed_fusion, embed_motion], dim=-1)
+        # embed_1 = embed_motion
+        embed_2, logits = self.BNNecks(embed_1)  # [n, c, 2p]
+
+        if self.inference_use_emb:
+            embed = embed_2
+        else:
+            embed = embed_1
+
+        visual_summary = {}
+
+        if self.vis:
+            for i in range(attn_map.shape[1]):
+                attention_heatmap = apply_attention_overlay(maps[:, :, :-1], attn_map[:, i:i + 1])
+                visual_summary[f'image/attn{i}'] = attention_heatmap
+
+        retval = {
+            'training_feat': {
+                'triplet': {'embeddings': embed_1, 'labels': labs},
+                'triplet_sils': {'embeddings': embed_sils, 'labels': labs},
+                'triplet_map': {'embeddings': embed_map, 'labels': labs},
+                'softmax': {'logits': logits, 'labels': labs},
+                'barlow_sils': {'x_a': embed_sils, 'x_b': embed_sils, 'weight': barlow_w},
+                'barlow_map': {'x_a': embed_map, 'x_b': embed_map, 'weight': barlow_w},
+            },
+            'visual_summary': visual_summary,
+            'inference_feat': {
+                'embeddings': embed
+            }
+        }
+        return retval
+
+
+class Shift_frame_attn(nn.Module):
+    def __init__(self, input_dim=512, output_dim=256, num_heads=8, head_dim=128):
+        super(Shift_frame_attn, self).__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.d_model = self.num_heads * self.head_dim
+        self.norm0 = nn.LayerNorm(head_dim)
+        self.norm1 = nn.LayerNorm(head_dim)
+        self.q_layer = nn.Linear(input_dim, self.d_model, bias=False)
+        self.k_layer = nn.Linear(input_dim, self.d_model, bias=False)
+        self.v_layer = nn.Linear(input_dim, self.d_model, bias=False)
+        self.out = nn.Linear(self.head_dim, input_dim)
+        self._construct_rope_matrices(16, 11)
+        self.FFN = nn.Sequential(nn.Linear(input_dim, input_dim//2), nn.LeakyReLU(), nn.Linear(input_dim//2, input_dim))
+
+    def _construct_rope_matrices(self, max_height, max_width):
+        """Constructs 2D rotary embedding matrices (for H and W axes separately).
+        Applies to input shape: [(n*s), (h*w), c] with c = head_dim.
+        """
+        assert self.head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
+        half_dim = self.head_dim // 2
+        quarter_dim = self.head_dim // 4
+
+        inv_freq = 1.0 / (100 ** (torch.arange(0, quarter_dim).float() / quarter_dim))
+
+        h_pos = torch.arange(max_height).float().unsqueeze(1) * inv_freq  # [H, D/4]
+        w_pos = torch.arange(max_width).float().unsqueeze(1) * inv_freq  # [W, D/4]
+
+        sin_h, cos_h = torch.sin(h_pos), torch.cos(h_pos)  # [H, D/4]
+        sin_w, cos_w = torch.sin(w_pos), torch.cos(w_pos)  # [W, D/4]
+
+        self.register_buffer("rope_sin_h", sin_h)  # [H, D/4]
+        self.register_buffer("rope_cos_h", cos_h)
+        self.register_buffer("rope_sin_w", sin_w)  # [W, D/4]
+        self.register_buffer("rope_cos_w", cos_w)
+
+    def _apply_rope(self, x, H, W):
+        """
+        Apply 2D rotary positional encoding on multi-head tensor.
+        Args:
+            x: [B, n_heads, HW, d_head]  -- flattened (H, W) spatial tokens
+            H, W: height and width (known constants like 11, 16)
+        Returns:
+            Tensor of same shape as input
+        """
+        B, n_heads, HW, d = x.shape
+        assert d == self.head_dim, f"d_head mismatch: got {d}, expected {self.head_dim}"
+        D = d // 4
+
+        # Reshape: [B, n_heads, H, W, d]
+        x = x.view(B, n_heads, H, W, d)
+
+        # Split into 4 parts
+        x_h1, x_h2 = x[..., :D], x[..., D:2 * D]
+        x_w1, x_w2 = x[..., 2 * D:3 * D], x[..., 3 * D:]
+
+        # Positional embeddings (sin/cos): [H, D] and [W, D]
+        sin_h = self.rope_sin_h[:H].view(1, 1, H, 1, D)  # broadcast to [B, n_heads, H, W, D]
+        cos_h = self.rope_cos_h[:H].view(1, 1, H, 1, D)
+        sin_w = self.rope_sin_w[:W].view(1, 1, 1, W, D)
+        cos_w = self.rope_cos_w[:W].view(1, 1, 1, W, D)
+
+        # Apply 2D rotation (height then width)
+        h_rotated = x_h1 * cos_h - x_h2 * sin_h
+        h_rotated_ = x_h2 * cos_h + x_h1 * sin_h
+
+        w_rotated = x_w1 * cos_w - x_w2 * sin_w
+        w_rotated_ = x_w2 * cos_w + x_w1 * sin_w
+
+        x_out = torch.cat([h_rotated, h_rotated_, w_rotated, w_rotated_], dim=-1)  # [B, n_heads, H, W, d]
+        return x_out.view(B, n_heads, HW, d)  # restore to original shape
+
+    def attn_map_diff_topk(self, max_indices, feat_norm, p, h, w, s, k=3):
+        """
+        max_indices: [ns, p, h_m] from values_bc.argmax(dim=2)
+        feat_norm: [n*p, s-1, h_m] — normalized differential features after subtraction
+        Returns:
+            heatmap: [ns, p, 256, 176] — where the top-k strongest differential features came from
+        """
+        device = feat_norm.device
+        ns, _, h_m = max_indices.shape
+        n = ns // (s - 1)
+
+        # Step 1: Convert flat patch index to (h, w)
+        h_indices = torch.div(max_indices, w, rounding_mode='trunc')  # [ns, p, h_m]
+        w_indices = max_indices % w
+
+        # Step 2: reshape feat_norm to match [n, p, s-1, h_m]
+        feat_norm = feat_norm.view(n, p, s - 1, h_m)
+        topk_vals, topk_inds = torch.topk(feat_norm.abs(), k=k, dim=-1)  # [n, p, s-1, k]
+
+        # Step 3: reshape max_indices to match [n, p, s-1, h_m]
+        h_indices = h_indices.view(n, s - 1, p, h_m).permute(0, 2, 1, 3)  # [n, p, s-1, h_m]
+        w_indices = w_indices.view(n, s - 1, p, h_m).permute(0, 2, 1, 3)
+
+        # Step 4: gather spatial locations of top-k features
+        topk_h = torch.gather(h_indices, dim=-1, index=topk_inds)  # [n, p, s-1, k]
+        topk_w = torch.gather(w_indices, dim=-1, index=topk_inds)  # [n, p, s-1, k]
+
+        # Step 5: prepare indices for fast scatter
+        batch_indices = torch.arange(n, device=device).view(n, 1, 1, 1).expand(n, p, s - 1, k).reshape(-1)
+        head_indices = torch.arange(p, device=device).view(1, p, 1, 1).expand(n, p, s - 1, k).reshape(-1)
+        time_indices = torch.arange(s - 1, device=device).view(1, 1, s - 1, 1).expand(n, p, s - 1, k).reshape(-1)
+        h_flat = topk_h.reshape(-1)
+        w_flat = topk_w.reshape(-1)
+
+        # Step 6: initialize and scatter into heatmap
+        heatmaps = torch.zeros((ns, p, h, w), device=device)
+        sample_idx = batch_indices * (s - 1) + time_indices  # maps [n, s-1] into flat [ns]
+
+        heatmaps.index_put_(
+            (sample_idx, head_indices, h_flat, w_flat),
+            torch.ones_like(h_flat, dtype=heatmaps.dtype),
+            accumulate=True
+        )
+
+        # Step 7: normalize and resize
+        # heatmaps = heatmaps / (heatmaps.amax(dim=(-2, -1), keepdim=True) + 1e-8)
+        heatmaps = (heatmaps > 0).float()  # flat color for all activated spots
+        att_map_resized = F.interpolate(heatmaps, size=(256, 176), mode='bilinear', align_corners=False)
+
+        return att_map_resized  # [ns, p, 256, 176]
+
+    def attn_map(self, values, p, h, w):
+        att_map = values.norm(dim=-1)
+        att_map = att_map.view(-1, p, h, w)
+        att_map_resized = F.interpolate(att_map, size=(256, 176), mode='bilinear', align_corners=False)  # [ns, p, h, w]
+        return att_map_resized
+
+    def forward(self, feat0, feat1, h, w):
+        """
+        input: [n*h*w, s, c]
+        feat0 sil guides feat1 map
+        output: ([n, p, s, c]), p is num_heads (part count)
+        """
+        assert feat0.size() == feat1.size()
+        n, s, c = feat0.size()
+        hw = h*w
+        pad = True
+
+        #  qkv heads
+        q_input = rearrange(feat0[:, 1:, :], "(n hw) s c -> (n s) hw c", hw=hw)
+        k_input = rearrange(feat0[:, :-1, :], "(n hw) s c -> (n s) hw c", hw=hw)
+        q = self.q_layer(q_input)  # [n(s-1), hw, c], front clip
+        k = self.k_layer(k_input)  # [n(s-1), hw, c], back clip
+        v = self.v_layer(feat1)  # [nhw, s, c]
+        q = rearrange(q, "n hw (p h_d) -> n p hw h_d", p=self.num_heads, h_d=self.head_dim)  # [n(s-1), p, hw, c]
+        k = rearrange(k, "n hw (p h_d) -> n p hw h_d", p=self.num_heads, h_d=self.head_dim)  # [n(s-1), p, hw, c]
+        q = self._apply_rope(q, h, w)
+        k = self._apply_rope(k, h, w)
+
+        feat1_bc = rearrange(feat1[:, :-1, :], "(n hw) s c -> (n s) hw c", hw=hw).unsqueeze(1).expand(-1, self.num_heads, -1, -1)
+        feat1_fc = rearrange(feat1[:, 1:, :], "(n hw) s c -> (n s) hw c", hw=hw).unsqueeze(1).expand(-1, self.num_heads, -1, -1)  # [n(s-1), p, hw, c]
+        v_bc = rearrange(v[:, :-1, :], "(n hw) s (p h_d) -> (n s) p hw h_d", hw=hw, p=self.num_heads, h_d=self.head_dim)
+        v_fc = rearrange(v[:, 1:, :], "(n hw) s (p h_d) -> (n s) p hw h_d", hw=hw, p=self.num_heads, h_d=self.head_dim)  # [n(s-1), p, hw, c]
+
+        # sil guided attention
+        d_k = q.size()[-1]
+        scaled = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(d_k)  # [n(s-1), p, hw, hw]
+        # assert torch.isfinite(scaled).all(), "scaled has Nan or Inf"
+        attention_bc = F.softmax(scaled, dim=-1)  # [n(s-1), p, hw, hw], original k, v pair
+        attention_fc = F.softmax(scaled.transpose(-2, -1), dim=-1)  # transposed q, v pair
+        values_bc = torch.matmul(attention_bc, v_bc)  # [n(s-1), p, hw, h_m]
+        values_fc = torch.matmul(attention_fc, v_fc)
+        values_bc = self.out(values_bc)
+        values_fc = self.out(values_fc)
+
+        # FFN
+        values_bc = feat1_bc + values_bc
+        values_bc = self.norm0(values_bc)
+        values_bc_ffn = self.FFN(values_bc)
+        results_bc = values_bc + values_bc_ffn
+
+        # print(feat1_fc.shape)
+        values_fc = feat1_fc + values_fc
+        values_fc = self.norm0(values_fc)
+        values_fc_ffn = self.FFN(values_fc)
+        results_fc = values_fc + values_fc_ffn
+
+        # differential attention
+        feat_atten_bc = torch.amax(results_bc, dim=2)  # [n(s-1), p, h_m]
+        feat_atten_fc = torch.amax(results_fc, dim=2)  # [n(s-1), p, h_m]
+        if s <= 1:
+           s = 2
+           pad = False
+        feat_atten_bc = rearrange(feat_atten_bc, "(n s) p h_m -> (n p) s h_m", s=s-1)  # [n*p, s-1, h_m]
+        feat_atten_fc = rearrange(feat_atten_fc, "(n s) p h_m -> (n p) s h_m", s=s-1)  # [n*p, s-1, h_m]
+        feat_df = feat_atten_fc - feat_atten_bc  # [n*p, s-1, h_m]
+        feat_norm0 = self.norm1(feat_df)
+        feat_norm1 = rearrange(feat_norm0, "np s c -> np c s")
+        if pad:
+            feat_norm1 = F.pad(feat_norm1, (0, 1))  # pad back to match original
+        else:
+            feat_norm1 = F.pad(feat_norm1, (0, 0, 0, 0, 0, self.num_heads), mode='constant', value=0)
+        out = rearrange(feat_norm1, "np c s -> np s c")
+
+        max_indices = values_bc.argmax(dim=2)  # [n(s-1), p, h_m]
+        attn_map = self.attn_map_diff_topk(max_indices=max_indices, feat_norm=feat_norm0, p=self.num_heads, h=16, w=11, s=s, k=128)
+        # attn_map = self.attn_map(attention_bc, p=self.num_heads, h=16, w=11)
+
+        return out, attn_map
+
+
+class ConditionalPosEmbedding(nn.Module):
+    def __init__(self, channels, kernel_size=3):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.conv = nn.Conv1d(channels, channels, kernel_size=3, padding=kernel_size // 2, groups=1)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [n, c, s, h, w]
+            cond: optional conditioning tensor [n, cond_channels, s, h, w]
+        Returns:
+            Positional encoded tensor of shape [n, c, s, h, w]
+        """
+        n, s, c = x.shape
+        x = x.permute(0, 2, 1)  # [n, c, s]
+
+        out = self.conv(x)  # [n, c, s]
+        out = out.permute(0, 2, 1)  # [n, s, c]
+        return out
+
+
+class AttentionFusion(nn.Module):
+    def __init__(self, in_channels=64, squeeze_ratio=16):
+        super(AttentionFusion, self).__init__()
+        hidden_dim = int(in_channels / squeeze_ratio)
+        self.conv = SetBlockWrapper(
+            nn.Sequential(
+                conv1x1(in_channels * 2, hidden_dim),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU(inplace=True),
+                conv3x3(hidden_dim, hidden_dim),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU(inplace=True),
+                conv1x1(hidden_dim, in_channels * 2),
+            )
+        )
+
+    def forward(self, sil_feat, map_feat):
+        '''
+            sil_feat: [n, c, s, h, w]
+            map_feat: [n, c, s, h, w]
+        '''
+        c = sil_feat.size(1)
+        feats = torch.cat([sil_feat, map_feat], dim=1)
+        score = self.conv(feats)  # [n, 2 * c, s, h, w]
+        score = rearrange(score, 'n (d c) s h w -> n d c s h w', d=2)
+        score = F.softmax(score, dim=1)
+        retun = sil_feat * score[:, 0] + map_feat * score[:, 1]
+        return retun
+
+
+def apply_attention_overlay(frames_rgb: torch.Tensor, heatmap_rgb: torch.Tensor, beta: float = 0.3) -> torch.Tensor:
+    '''
+    :param frames_rgb:  [n, c, s, h, w]
+    :param heatmap_rgb:  [ns, 1, h, w]
+    :param beta:
+    :return:
+    '''
+    if not (0.0 <= beta <= 1.0):
+        raise ValueError("beta must be in [0, 1].")
+    frames = rearrange(frames_rgb, "n c s h w -> (n s) c h w")
+    frames_up = F.interpolate(frames, size=heatmap_rgb.shape[-2:], mode='bilinear', align_corners=False)
+    if heatmap_rgb.shape[1] == 1 and frames.shape[1] == 3:
+        heatmap_rgb = heatmap_rgb.repeat(1, 3, 1, 1)  # [ns, 3, H, W]
+
+    # Apply overlay
+    overlay = (1 - beta) * frames_up + beta * heatmap_rgb * 255.
+    return overlay
