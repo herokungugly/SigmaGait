@@ -45,7 +45,7 @@ class SigmaGait(BaseModel):
         self.d_model = self.num_heads * self.head_dim
         self.norm0 = nn.LayerNorm(256)
         self.norm1 = nn.LayerNorm(256)
-        self.motion_attn = Shift_frame_attn(input_dim=256, output_dim=256, num_heads=self.num_heads, head_dim=self.head_dim)
+        self.motion_attn = sigma_module(input_dim=256, output_dim=256, num_heads=self.num_heads, head_dim=self.head_dim)
         self.fusion = AttentionFusion(512)
         self.sil_CPE = ConditionalPosEmbedding(256)
         self.map_CPE = ConditionalPosEmbedding(256)
@@ -192,9 +192,9 @@ class SigmaGait(BaseModel):
         return retval
 
 
-class Shift_frame_attn(nn.Module):
+class sigma_module(nn.Module):
     def __init__(self, input_dim=512, output_dim=256, num_heads=8, head_dim=128):
-        super(Shift_frame_attn, self).__init__()
+        super(sigma_module, self).__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.d_model = self.num_heads * self.head_dim
